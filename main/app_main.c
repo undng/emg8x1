@@ -53,51 +53,13 @@
 
 #include "esp_chip_info.h"
 #include "esp_timer.h" // Для esp_timer_get_time()
+
 #include "wifi_manager.h"
+#include "telnet_console.h"
 
 spi_device_handle_t spi_dev;
 
-#define TELNET_PORT 23
-#define MAX_CLIENTS 2
-#define CMD_BUFFER_SIZE 256
-#define RESPONSE_BUFFER_SIZE 512
 
-esp_err_t telnet_console_init(void);
-void telnet_console_task(void *pvParameter);
-// Структура клиента telnet
-typedef struct
-{
-    int socket;
-    bool active;
-    char cmd_buffer[CMD_BUFFER_SIZE];
-    int cmd_pos;
-} telnet_client_t;
-
-// Структура команды консоли
-typedef struct
-{
-    const char *cmd;
-    esp_err_t (*handler)(int socket, int argc, char **argv);
-    const char *help;
-} console_command_t;
-
-// Глобальные переменные telnet
-static telnet_client_t telnet_clients[MAX_CLIENTS];
-static int telnet_server_socket = -1;
-static const char *TELNET_TAG = "TELNET_CONSOLE";
-
-// Функции telnet консоли
-static void telnet_send_response(int client_socket, const char *response);
-static void send_prompt(int socket);
-static esp_err_t cmd_help(int socket, int argc, char **argv);
-static esp_err_t cmd_status(int socket, int argc, char **argv);
-static esp_err_t cmd_set_channel(int socket, int argc, char **argv);
-static esp_err_t cmd_read_reg(int socket, int argc, char **argv);
-static esp_err_t cmd_write_reg(int socket, int argc, char **argv);
-static esp_err_t cmd_reset_adc(int socket, int argc, char **argv);
-static esp_err_t cmd_start_stop(int socket, int argc, char **argv);
-static esp_err_t cmd_reboot(int socket, int argc, char **argv);
-static esp_err_t cmd_info(int socket, int argc, char **argv);
 
 
 
@@ -198,13 +160,13 @@ static const uint8_t AD1299_ADDR_CH8SET = 0x0c;
 // TCP server port to listen, use 'idf.py menuconfig' to change this constant
 // CONFIG_EMG8X_TCP_SERVER_PORT =                           3000
 
-IRAM_ATTR void spi_data_pump_task(void *pvParameter);
+ void spi_data_pump_task(void *pvParameter);
 
 DRAM_ATTR spi_device_handle_t spi_dev;
 
 DRAM_ATTR TaskHandle_t tcpTaskHandle;
 DRAM_ATTR TaskHandle_t datapumpTaskHandle;
-DRAM_ATTR TaskHandle_t telnetTaskHandle;
+
 
 // DRDY signal interrupt context
 typedef struct
@@ -386,7 +348,7 @@ void tcp_server_task(void *pvParameter)
 
     // This routine is based on https://github.com/sankarcheppali/esp_idf_esp32_posts/blob/master/tcp_server/sta_mode/main/esp_sta_tcp_server.c
 
-    type_tcp_server_thread_context *pTcpServerContext = (type_tcp_server_thread_context *)pvParameter;
+    (void)pvParameter;
 
     struct sockaddr_in tcpServerAddr;
     tcpServerAddr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -426,8 +388,11 @@ void tcp_server_task(void *pvParameter)
             continue;
         }
 
-    char current_ip[16];
+     char current_ip[16];
     wifi_manager_get_ip(current_ip, sizeof(current_ip));
+    strncpy(tcp_server_thread_context.serverIpAddr, current_ip, sizeof(tcp_server_thread_context.serverIpAddr) - 1);
+    tcp_server_thread_context.serverIpAddr[sizeof(tcp_server_thread_context.serverIpAddr) - 1] = '\0';
+
     ESP_LOGI(TAG, "TCP server started at %s, listen on the port: %d", 
              current_ip, CONFIG_EMG8X_TCP_SERVER_PORT);
         // data transfer cycle
@@ -494,6 +459,195 @@ void tcp_server_task(void *pvParameter)
     }
 }
 
+#if CONFIG_EMG8X_BOARD_EMULATION == 0
+// ADC callback functions (только для реального железа)
+static esp_err_t console_adc_read_reg(uint8_t addr, uint8_t *value)
+{
+    if (value == NULL) return ESP_ERR_INVALID_ARG;
+    
+    // Остановим сбор данных
+    ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    *value = ad1299_rreg(spi_dev, addr);
+    
+    // Возобновим сбор данных
+    ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_write_reg(uint8_t addr, uint8_t value)
+{
+    // Остановим сбор данных
+    ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    ad1299_wreg(spi_dev, addr, value);
+    
+    // Возобновим сбор данных
+    ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_reset(void)
+{
+    // Выполним reset ADC
+    gpio_set_level(AD1299_RESET_PIN, 0);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    gpio_set_level(AD1299_RESET_PIN, 1);
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_start_stop(bool start)
+{
+    if (start) {
+        gpio_set_level(AD1299_START_PIN, 1);
+        ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
+    } else {
+        gpio_set_level(AD1299_START_PIN, 0);
+        ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
+    }
+    
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_set_channel(int channel, int gain, int mode)
+{
+    if (channel < 1 || channel > 8 || gain < 0 || gain > 6 || mode < 0 || mode > 7) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // Остановим сбор данных
+    ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    // Установим параметры канала
+    uint8_t ch_set = (mode << 4) | gain;
+    ad1299_wreg(spi_dev, AD1299_ADDR_CH1SET + (channel - 1), ch_set);
+    
+    // Возобновим сбор данных
+    ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+    
+    return ESP_OK;
+}
+
+#else
+// Эмуляция для режима без железа
+static esp_err_t console_adc_read_reg(uint8_t addr, uint8_t *value)
+{
+    if (value == NULL) return ESP_ERR_INVALID_ARG;
+    *value = 0x00; // Эмулированное значение
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_write_reg(uint8_t addr, uint8_t value)
+{
+    // Эмуляция записи
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_reset(void)
+{
+    // Эмуляция сброса
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_start_stop(bool start)
+{
+    // Эмуляция старт/стоп
+    return ESP_OK;
+}
+
+static esp_err_t console_adc_set_channel(int channel, int gain, int mode)
+{
+    if (channel < 1 || channel > 8 || gain < 0 || gain > 6 || mode < 0 || mode > 7) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Эмуляция настройки канала
+    return ESP_OK;
+}
+#endif
+
+// Системные callback функции
+static uint32_t console_get_block_counter(void)
+{
+    return drdy_thread_context.blockCounter;
+}
+
+static int console_get_sample_count(void)
+{
+    return drdy_thread_context.sampleCount;
+}
+
+static int console_get_queue_head(void)
+{
+    return drdy_thread_context.head;
+}
+
+static int console_get_queue_tail(void)
+{
+    return drdy_thread_context.tail;
+}
+
+static uint32_t console_get_free_heap_size(void)
+{
+    return esp_get_free_heap_size();
+}
+
+static uint32_t console_get_min_free_heap_size(void)
+{
+    return esp_get_minimum_free_heap_size();
+}
+
+static uint64_t console_get_uptime_ms(void)
+{
+    return esp_timer_get_time() / 1000;
+}
+
+// WiFi callback функции
+static bool console_wifi_is_ap_mode(void)
+{
+    return wifi_manager_is_ap_mode();
+}
+
+static esp_err_t console_wifi_get_ip(char *buffer, size_t size)
+{
+    return wifi_manager_get_ip(buffer, size);
+}
+
+static esp_err_t console_wifi_switch_mode(void)
+{
+    return wifi_manager_switch_mode();
+}
+static const console_callbacks_t console_callbacks = {
+    // ADC operations
+    .adc_read_reg = console_adc_read_reg,
+    .adc_write_reg = console_adc_write_reg,
+    .adc_reset = console_adc_reset,
+    .adc_start_stop = console_adc_start_stop,
+    .adc_set_channel = console_adc_set_channel,
+    
+    // System status
+    .get_block_counter = console_get_block_counter,
+    .get_sample_count = console_get_sample_count,
+    .get_queue_head = console_get_queue_head,
+    .get_queue_tail = console_get_queue_tail,
+    .get_free_heap_size = console_get_free_heap_size,
+    .get_min_free_heap_size = console_get_min_free_heap_size,
+    .get_uptime_ms = console_get_uptime_ms,
+    
+    // WiFi operations
+    .wifi_is_ap_mode = console_wifi_is_ap_mode,
+    .wifi_get_ip = console_wifi_get_ip,
+    .wifi_switch_mode = console_wifi_switch_mode,
+};
 static void emg8x_app_start(void)
 {
 #if CONFIG_EMG8X_BOARD_EMULATION == 0
@@ -785,11 +939,17 @@ static void emg8x_app_start(void)
 
 #endif
 
-    telnet_console_init();
-    xTaskCreatePinnedToCore(&telnet_console_task, "telnet_console_task", 4096, NULL, tskIDLE_PRIORITY + 3, &telnetTaskHandle, 0);
-    configASSERT(telnetTaskHandle);
-
-    ESP_LOGI(TAG, "Telnet console started on port 23");
+    esp_err_t console_ret = telnet_console_init(&console_callbacks);
+    if (console_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize telnet console: %s", esp_err_to_name(console_ret));
+    } else {
+        console_ret = telnet_console_start();
+        if (console_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start telnet console: %s", esp_err_to_name(console_ret));
+        } else {
+            ESP_LOGI(TAG, "Telnet console started on port %d", TELNET_PORT);
+        }
+    }
 }
 
 #if CONFIG_EMG8X_BOARD_EMULATION
@@ -803,12 +963,11 @@ int numSamplesToMilliseconds(int numSamples)
 // float my_data_array[4096] ;
 // int32_t sampleCounter = 0 ;
 
-IRAM_ATTR void spi_data_pump_task(void *pvParameter)
+ void spi_data_pump_task(void *pvParameter)
 {
     ESP_LOGI(TAG, "spi_data_pump_task started at CpuCore%1d\n", xPortGetCoreID());
 
-    // Queue full flag
-    int queueFull = 0;
+   
 
     // Continuous capture the data
     while (1)
@@ -935,654 +1094,6 @@ IRAM_ATTR void spi_data_pump_task(void *pvParameter)
 
 
 
-
-
-
-
-
-
-
-// ==============================================
-// РЕАЛИЗАЦИЯ ФУНКЦИЙ TELNET КОНСОЛИ
-// ==============================================
-
-static void telnet_send_response(int client_socket, const char *response)
-{
-    if (client_socket >= 0)
-    {
-        send(client_socket, response, strlen(response), 0);
-    }
-}
-
-static void send_prompt(int socket)
-{
-    telnet_send_response(socket, "EMG8x> ");
-}
-
-static esp_err_t cmd_status(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-    snprintf(response, sizeof(response),
-             "\r\nEMG8x Status:\r\n"
-             "=============\r\n"
-             "Block Counter: %u\r\n"
-             "Sample Count: %d\r\n"
-             "Queue Head: %d\r\n"
-             "Queue Tail: %d\r\n"
-             "Free Heap: %u bytes\r\n"
-             "\r\n",
-             (unsigned)drdy_thread_context.blockCounter,
-             drdy_thread_context.sampleCount,
-             drdy_thread_context.head,
-             drdy_thread_context.tail,
-             (unsigned)esp_get_free_heap_size());
-
-    telnet_send_response(socket, response);
-    return ESP_OK;
-}
-
-static esp_err_t cmd_set_channel(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-    if (argc != 4)
-    {
-        snprintf(response, sizeof(response),
-                 "\r\nUsage: setch <channel> <gain> <mode>\r\n"
-                 "channel: 1-8\r\n"
-                 "gain: 0=x1, 1=x2, 2=x4, 3=x6, 4=x8, 5=x12, 6=x24\r\n"
-                 "mode: 0=normal, 1=short, 3=test, 4=rld_drp, 5=rld_drn, 6=rld_drl, 7=mvdd\r\n\r\n");
-        telnet_send_response(socket, response);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    int channel = atoi(argv[1]);
-    int gain = atoi(argv[2]);
-    int mode = atoi(argv[3]);
-
-    if (channel < 1 || channel > 8 || gain < 0 || gain > 6 || mode < 0 || mode > 7)
-    {
-        snprintf(response, sizeof(response), "\r\nInvalid parameters\r\n\r\n");
-        telnet_send_response(socket, response);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-#if CONFIG_EMG8X_BOARD_EMULATION == 0
-    // Остановим сбор данных
-    ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
-    // Установим параметры канала
-    uint8_t ch_set = (mode << 4) | gain;
-    ad1299_wreg(spi_dev, AD1299_ADDR_CH1SET + (channel - 1), ch_set);
-
-    // Возобновим сбор данных
-    ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-#endif
-
-    snprintf(response, sizeof(response),
-             "\r\nChannel %d configured: gain=%d, mode=%d\r\n\r\n",
-             channel, gain, mode);
-    telnet_send_response(socket, response);
-
-    return ESP_OK;
-}
-
-static esp_err_t cmd_read_reg(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-    if (argc != 2)
-    {
-        snprintf(response, sizeof(response), "\r\nUsage: rreg <addr>\r\n\r\n");
-        telnet_send_response(socket, response);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    int addr = strtol(argv[1], NULL, 16);
-    if (addr < 0 || addr > 0xFF)
-    {
-        snprintf(response, sizeof(response), "\r\nInvalid address\r\n\r\n");
-        telnet_send_response(socket, response);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-#if CONFIG_EMG8X_BOARD_EMULATION == 0
-    // Остановим сбор данных
-    ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
-    uint8_t value = ad1299_rreg(spi_dev, addr);
-
-    // Возобновим сбор данных
-    ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
-    snprintf(response, sizeof(response),
-             "\r\nRegister 0x%02X = 0x%02X\r\n\r\n", addr, value);
-#else
-    snprintf(response, sizeof(response),
-             "\r\nEMULATION: Register 0x%02X = 0x00 (emulated)\r\n\r\n", addr);
-#endif
-
-    telnet_send_response(socket, response);
-    return ESP_OK;
-}
-
-static esp_err_t cmd_write_reg(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-    if (argc != 3)
-    {
-        snprintf(response, sizeof(response), "\r\nUsage: wreg <addr> <value>\r\n\r\n");
-        telnet_send_response(socket, response);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    int addr = strtol(argv[1], NULL, 16);
-    int value = strtol(argv[2], NULL, 16);
-
-    if (addr < 0 || addr > 0xFF || value < 0 || value > 0xFF)
-    {
-        snprintf(response, sizeof(response), "\r\nInvalid parameters\r\n\r\n");
-        telnet_send_response(socket, response);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-#if CONFIG_EMG8X_BOARD_EMULATION == 0
-    // Остановим сбор данных
-    ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-
-    ad1299_wreg(spi_dev, addr, value);
-
-    // Возобновим сбор данных
-    ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
-    vTaskDelay(10 / portTICK_PERIOD_MS);
-#endif
-
-    snprintf(response, sizeof(response),
-             "\r\nRegister 0x%02X = 0x%02X written\r\n\r\n", addr, value);
-    telnet_send_response(socket, response);
-
-    return ESP_OK;
-}
-
-static esp_err_t cmd_reset_adc(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-#if CONFIG_EMG8X_BOARD_EMULATION == 0
-    // Выполним reset ADC
-    gpio_set_level(AD1299_RESET_PIN, 0);
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    gpio_set_level(AD1299_RESET_PIN, 1);
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-
-    snprintf(response, sizeof(response), "\r\nADC reset completed\r\n\r\n");
-#else
-    snprintf(response, sizeof(response), "\r\nEMULATION: ADC reset (emulated)\r\n\r\n");
-#endif
-
-    telnet_send_response(socket, response);
-    return ESP_OK;
-}
-
-static esp_err_t cmd_start_stop(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-#if CONFIG_EMG8X_BOARD_EMULATION == 0
-    if (strcmp(argv[0], "start") == 0)
-    {
-        gpio_set_level(AD1299_START_PIN, 1);
-        ad1299_send_cmd8(spi_dev, AD1299_CMD_RDATAC);
-        snprintf(response, sizeof(response), "\r\nData acquisition started\r\n\r\n");
-    }
-    else
-    {
-        gpio_set_level(AD1299_START_PIN, 0);
-        ad1299_send_cmd8(spi_dev, AD1299_CMD_SDATAC);
-        snprintf(response, sizeof(response), "\r\nData acquisition stopped\r\n\r\n");
-    }
-#else
-    if (strcmp(argv[0], "start") == 0)
-    {
-        snprintf(response, sizeof(response), "\r\nEMULATION: Data acquisition started\r\n\r\n");
-    }
-    else
-    {
-        snprintf(response, sizeof(response), "\r\nEMULATION: Data acquisition stopped\r\n\r\n");
-    }
-#endif
-
-    telnet_send_response(socket, response);
-    return ESP_OK;
-}
-
-static esp_err_t cmd_reboot(int socket, int argc, char **argv)
-{
-    telnet_send_response(socket, "\r\nRebooting device in 3 seconds...\r\n\r\n");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    esp_restart();
-    return ESP_OK;
-}
-
-// static esp_err_t cmd_info(int socket, int argc, char** argv) {
-//     char response[RESPONSE_BUFFER_SIZE];
-//     esp_chip_info_t chip_info;
-//     esp_chip_info(&chip_info);
-
-//     snprintf(response, sizeof(response),
-//         "\r\nSystem Information:\r\n"
-//         "==================\r\n"
-//         "IDF Version: %s\r\n"
-//         "Chip Model: %s\r\n"
-//         "Cores: %d\r\n"
-//         "Free Heap: %u bytes\r\n"
-//         "Min Free Heap: %u bytes\r\n"
-//         "Uptime: %llu ms\r\n"
-// #if CONFIG_EMG8X_BOARD_EMULATION == 0
-//         "Mode: Hardware\r\n"
-// #else
-//         "Mode: Emulation\r\n"
-// #endif
-//         "\r\n",
-//         esp_get_idf_version(),
-//         (chip_info.model == CHIP_ESP32) ? "ESP32" :
-//         (chip_info.model == CHIP_ESP32S2) ? "ESP32-S2" : "Unknown",
-//         chip_info.cores,
-//         (unsigned)esp_get_free_heap_size(),
-//         (unsigned)esp_get_minimum_free_heap_size(),
-//         esp_timer_get_time() / 1000
-//     );
-
-//     telnet_send_response(socket, response);
-//     return ESP_OK;
-// }
-
-static int parse_command(char *cmd_line, char **argv, int max_args)
-{
-    int argc = 0;
-    char *token = strtok(cmd_line, " \r\n");
-
-    while (token != NULL && argc < max_args)
-    {
-        argv[argc++] = token;
-        token = strtok(NULL, " \r\n");
-    }
-
-    return argc;
-}
-
-// ==============================================
-// ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ TELNET ДЛЯ УПРАВЛЕНИЯ WiFi
-// ==============================================
-
-static esp_err_t cmd_info(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-    esp_chip_info_t chip_info;
-    esp_chip_info(&chip_info);
-
-    snprintf(response, sizeof(response),
-             "\r\nSystem Information:\r\n"
-             "==================\r\n"
-             "IDF Version: %s\r\n"
-             "Chip Model: %s\r\n"
-             "Cores: %d\r\n"
-             "Free Heap: %u bytes\r\n"
-             "Min Free Heap: %u bytes\r\n"
-             "Uptime: %llu ms\r\n"
-#if CONFIG_EMG8X_BOARD_EMULATION == 0
-             "Mode: Hardware\r\n"
-#else
-             "Mode: Emulation\r\n"
-#endif
-             "\r\n",
-             esp_get_idf_version(),
-             (chip_info.model == CHIP_ESP32) ? "ESP32" : (chip_info.model == CHIP_ESP32S2) ? "ESP32-S2"
-                                                                                           : "Unknown",
-             chip_info.cores,
-             (unsigned)esp_get_free_heap_size(),
-             (unsigned)esp_get_minimum_free_heap_size(),
-             (unsigned long long)(esp_timer_get_time() / 1000) // Исправлен тип данных
-    );
-
-    telnet_send_response(socket, response);
-    return ESP_OK;
-}
-
-// ИСПРАВЛЕННЫЕ WiFi КОМАНДЫ
-static esp_err_t cmd_wifi_info(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-
-    snprintf(response, sizeof(response),
-             "\r\nWiFi Information:\r\n"
-             "=================\r\n"
-             "Current Mode: %s\r\n"
-             "IP Address: %s\r\n"
-             "\r\n"
-             "Available Commands:\r\n"
-             "- Hold BOOT button for 3 sec to switch mode\r\n"
-             "- wifi_switch - Switch WiFi mode via command\r\n"
-             "\r\n"
-             "Modes:\r\n"
-             "- STA (Client): Connects to existing WiFi\r\n"
-             "- AP (Access Point): Creates WiFi hotspot\r\n"
-             "  SSID: %s\r\n"
-             "  Password: %s\r\n"
-             "  IP: %s\r\n"
-             "\r\n",
-             wifi_manager_is_ap_mode() ? "AP (Access Point)" : "STA (Client)",
-             tcp_server_thread_context.serverIpAddr,
-             AP_MODE_SSID,
-             AP_MODE_PASSWORD,
-             AP_MODE_IP);
-
-    telnet_send_response(socket, response);
-    return ESP_OK;
-}
-
-static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv) {
-    char response[RESPONSE_BUFFER_SIZE];
-    
-    snprintf(response, sizeof(response),
-             "\r\nSwitching WiFi mode from %s to %s\r\n"
-             "Device will reboot in 3 seconds...\r\n\r\n",
-             wifi_manager_is_ap_mode() ? "AP" : "STA",
-             wifi_manager_is_ap_mode() ? "STA" : "AP");
-
-    telnet_send_response(socket, response);
-    
-    // Use the wifi_manager function
-    wifi_manager_switch_mode();
-    
-    return ESP_OK;
-}
-
-static const console_command_t telnet_commands[] = {
-    {"help", cmd_help, "Show available commands"},
-    {"status", cmd_status, "Show device status"},
-    {"info", cmd_info, "Show system information"},
-    {"wifi", cmd_wifi_info, "Show WiFi information and modes"},
-    {"wifi_switch", cmd_wifi_switch, "Switch WiFi mode (STA/AP)"},
-    {"setch", cmd_set_channel, "setch <ch> <gain> <mode> - Set channel parameters"},
-    {"rreg", cmd_read_reg, "rreg <addr> - Read register"},
-    {"wreg", cmd_write_reg, "wreg <addr> <value> - Write register"},
-    {"reset", cmd_reset_adc, "Reset ADC"},
-    {"start", cmd_start_stop, "start/stop - Start/stop data acquisition"},
-    {"stop", cmd_start_stop, "start/stop - Start/stop data acquisition"},
-    {"reboot", cmd_reboot, "Reboot the device"},
-    {"exit", NULL, "Disconnect from console"},
-    {NULL, NULL, NULL}};
-
-static esp_err_t cmd_help(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-    snprintf(response, sizeof(response),
-             "\r\nEMG8x Console Commands:\r\n"
-             "======================\r\n");
-    telnet_send_response(socket, response);
-
-    for (int i = 0; telnet_commands[i].cmd != NULL; i++)
-    {
-        snprintf(response, sizeof(response),
-                 "%-10s - %s\r\n", telnet_commands[i].cmd, telnet_commands[i].help);
-        telnet_send_response(socket, response);
-    }
-    telnet_send_response(socket, "\r\n");
-    return ESP_OK;
-}
-
-static void execute_command(int socket, char *cmd_line)
-{
-    char *argv[16];
-    int argc = parse_command(cmd_line, argv, 16);
-
-    if (argc == 0)
-    {
-        send_prompt(socket);
-        return;
-    }
-
-    // Специальная обработка команды exit
-    if (strcmp(argv[0], "exit") == 0)
-    {
-        telnet_send_response(socket, "\r\nGoodbye!\r\n");
-        close(socket);
-        return;
-    }
-
-    for (int i = 0; telnet_commands[i].cmd != NULL; i++)
-    {
-        if (strcmp(argv[0], telnet_commands[i].cmd) == 0)
-        {
-            if (telnet_commands[i].handler != NULL)
-            {
-                telnet_commands[i].handler(socket, argc, argv);
-            }
-            send_prompt(socket);
-            return;
-        }
-    }
-
-    char response[RESPONSE_BUFFER_SIZE];
-    snprintf(response, sizeof(response),
-             "\r\nUnknown command: %s\r\nType 'help' for available commands\r\n\r\n", argv[0]);
-    telnet_send_response(socket, response);
-    send_prompt(socket);
-}
-static void handle_client_data(telnet_client_t *client, char *data, int len)
-{
-    for (int i = 0; i < len; i++)
-    {
-        char c = data[i];
-
-        if (c == '\r' || c == '\n')
-        {
-            if (client->cmd_pos > 0)
-            {
-                client->cmd_buffer[client->cmd_pos] = '\0';
-                telnet_send_response(client->socket, "\r\n");
-                execute_command(client->socket, client->cmd_buffer);
-                client->cmd_pos = 0;
-            }
-            else
-            {
-                send_prompt(client->socket);
-            }
-        }
-        else if (c == '\b' || c == 127)
-        { // Backspace
-            if (client->cmd_pos > 0)
-            {
-                client->cmd_pos--;
-                telnet_send_response(client->socket, "\b \b");
-            }
-        }
-        else if (c == 3)
-        { // Ctrl+C
-            telnet_send_response(client->socket, "\r\n^C\r\n");
-            client->cmd_pos = 0;
-            send_prompt(client->socket);
-        }
-        else if (c == 27)
-        { // ESC sequence (стрелки и т.д.)
-            // Игнорируем escape последовательности
-            continue;
-        }
-        else if (c >= 32 && c < 127)
-        { // Printable characters
-            if (client->cmd_pos < CMD_BUFFER_SIZE - 1)
-            {
-                client->cmd_buffer[client->cmd_pos++] = c;
-                send(client->socket, &c, 1, 0);
-            }
-        }
-        // Игнорируем все остальные символы (включая спецсимволы telnet)
-    }
-}
-
-esp_err_t telnet_console_init(void)
-{
-    memset(telnet_clients, 0, sizeof(telnet_clients));
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        telnet_clients[i].socket = -1;
-    }
-
-    ESP_LOGI(TELNET_TAG, "Telnet console initialized");
-    return ESP_OK;
-}
-
-void telnet_console_task(void *pvParameter)
-{
-    struct sockaddr_in server_addr;
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    fd_set read_fds;
-    int max_fd;
-
-    // Создаем серверный сокет
-    telnet_server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (telnet_server_socket < 0)
-    {
-        ESP_LOGE(TELNET_TAG, "Failed to create socket");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    int opt = 1;
-    setsockopt(telnet_server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(TELNET_PORT);
-
-    if (bind(telnet_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-    {
-        ESP_LOGE(TELNET_TAG, "Bind failed");
-        close(telnet_server_socket);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (listen(telnet_server_socket, MAX_CLIENTS) < 0)
-    {
-        ESP_LOGE(TELNET_TAG, "Listen failed");
-        close(telnet_server_socket);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TELNET_TAG, "Telnet console listening on port %d", TELNET_PORT);
-
-    while (1)
-    {
-        FD_ZERO(&read_fds);
-        FD_SET(telnet_server_socket, &read_fds);
-        max_fd = telnet_server_socket;
-
-        // Добавляем активные клиентские сокеты
-        for (int i = 0; i < MAX_CLIENTS; i++)
-        {
-            if (telnet_clients[i].active && telnet_clients[i].socket >= 0)
-            {
-                FD_SET(telnet_clients[i].socket, &read_fds);
-                if (telnet_clients[i].socket > max_fd)
-                {
-                    max_fd = telnet_clients[i].socket;
-                }
-            }
-        }
-
-        struct timeval timeout = {1, 0}; // 1 секунда таймаут
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-
-        if (activity < 0)
-        {
-            ESP_LOGE(TELNET_TAG, "Select error");
-            continue;
-        }
-
-        // Новое подключение
-        if (FD_ISSET(telnet_server_socket, &read_fds))
-        {
-            int new_socket = accept(telnet_server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
-            if (new_socket >= 0)
-            {
-                // Найдем свободное место для клиента
-                int client_idx = -1;
-                for (int i = 0; i < MAX_CLIENTS; i++)
-                {
-                    if (!telnet_clients[i].active)
-                    {
-                        client_idx = i;
-                        break;
-                    }
-                }
-
-                if (client_idx >= 0)
-                {
-                    telnet_clients[client_idx].socket = new_socket;
-                    telnet_clients[client_idx].active = true;
-                    telnet_clients[client_idx].cmd_pos = 0;
-
-                    ESP_LOGI(TELNET_TAG, "New telnet client connected: %s",
-                             inet_ntoa(client_addr.sin_addr));
-
-                    // Отправляем Telnet negotiation для отключения echo и line mode
-                    char telnet_init[] = {255, 251, 1,  // IAC WILL ECHO (сервер будет делать echo)
-                                          255, 251, 3,  // IAC WILL SUPPRESS-GO-AHEAD
-                                          255, 253, 1,  // IAC DO ECHO (клиент не должен делать echo)
-                                          255, 253, 3}; // IAC DO SUPPRESS-GO-AHEAD
-                    send(new_socket, telnet_init, sizeof(telnet_init), 0);
-
-                    telnet_send_response(new_socket,
-                                         "\r\nWelcome to EMG8x Console!\r\nType 'help' for available commands.\r\n");
-                    send_prompt(new_socket);
-                }
-                else
-                {
-                    telnet_send_response(new_socket,
-                                         "\r\nSorry, maximum clients connected.\r\n");
-                    close(new_socket);
-                }
-            }
-        }
-
-        // Обработка данных от клиентов
-        for (int i = 0; i < MAX_CLIENTS; i++)
-        {
-            if (telnet_clients[i].active && FD_ISSET(telnet_clients[i].socket, &read_fds))
-            {
-                char buffer[256];
-                int bytes_read = recv(telnet_clients[i].socket, buffer, sizeof(buffer) - 1, 0);
-
-                if (bytes_read <= 0)
-                {
-                    ESP_LOGI(TELNET_TAG, "Client disconnected");
-                    close(telnet_clients[i].socket);
-                    telnet_clients[i].active = false;
-                    telnet_clients[i].socket = -1;
-                }
-                else
-                {
-                    buffer[bytes_read] = '\0';
-                    handle_client_data(&telnet_clients[i], buffer, bytes_read);
-                }
-            }
-        }
-    }
-
-    close(telnet_server_socket);
-    vTaskDelete(NULL);
-}
 
 void app_main()
 {
