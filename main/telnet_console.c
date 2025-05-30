@@ -1,8 +1,3 @@
-//
-// telnet_console.c - Telnet console implementation for EMG8x
-// Provides remote command-line interface for device configuration and monitoring
-//
-
 #include "telnet_console.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -39,17 +34,33 @@ static const console_callbacks_t *g_callbacks = NULL;
 
 static void telnet_send_response(int client_socket, const char *response);
 static void send_prompt(int socket);
+
+// Basic commands
 static esp_err_t cmd_help(int socket, int argc, char **argv);
 static esp_err_t cmd_status(int socket, int argc, char **argv);
 static esp_err_t cmd_info(int socket, int argc, char **argv);
-static esp_err_t cmd_wifi_info(int socket, int argc, char **argv);
-static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv);
+static esp_err_t cmd_reboot(int socket, int argc, char **argv);
+
+// ADC commands  
 static esp_err_t cmd_set_channel(int socket, int argc, char **argv);
 static esp_err_t cmd_read_reg(int socket, int argc, char **argv);
 static esp_err_t cmd_write_reg(int socket, int argc, char **argv);
 static esp_err_t cmd_reset_adc(int socket, int argc, char **argv);
 static esp_err_t cmd_start_stop(int socket, int argc, char **argv);
-static esp_err_t cmd_reboot(int socket, int argc, char **argv);
+
+static esp_err_t cmd_wifi_info(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_set_sta(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_set_ap(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_config(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_apply(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_save(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_reset(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_scan(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_scan_results(int socket, int argc, char **argv);
+static esp_err_t cmd_wifi_status(int socket, int argc, char **argv);
+
+// Utility functions
 static int parse_command(char *cmd_line, char **argv, int max_args);
 static void execute_command(int socket, char *cmd_line);
 static void handle_client_data(telnet_client_t *client, char *data, int len);
@@ -59,18 +70,36 @@ static void handle_client_data(telnet_client_t *client, char *data, int len);
 // ==============================================
 
 static const console_command_t telnet_commands[] = {
+    // Basic system commands
     {"help", cmd_help, "Show available commands"},
     {"status", cmd_status, "Show device status"},
     {"info", cmd_info, "Show system information"},
-    {"wifi", cmd_wifi_info, "Show WiFi information and modes"},
-    {"wifi_switch", cmd_wifi_switch, "Switch WiFi mode (STA/AP)"},
+    {"reboot", cmd_reboot, "Reboot the device"},
+    
+    // ADC commands
     {"setch", cmd_set_channel, "setch <ch> <gain> <mode> - Set channel parameters"},
     {"rreg", cmd_read_reg, "rreg <addr> - Read register"},
     {"wreg", cmd_write_reg, "wreg <addr> <value> - Write register"},
     {"reset", cmd_reset_adc, "Reset ADC"},
     {"start", cmd_start_stop, "start/stop - Start/stop data acquisition"},
     {"stop", cmd_start_stop, "start/stop - Start/stop data acquisition"},
-    {"reboot", cmd_reboot, "Reboot the device"},
+    
+    // WiFi commands (legacy)
+    {"wifi", cmd_wifi_info, "Show WiFi information and modes"},
+    {"wifi_switch", cmd_wifi_switch, "Switch WiFi mode (STA/AP)"},
+    
+    // WiFi commands (enhanced)
+    {"wifi_set_sta", cmd_wifi_set_sta, "wifi_set_sta <ssid> <password> - Configure STA mode"},
+    {"wifi_set_ap", cmd_wifi_set_ap, "wifi_set_ap <ssid> <password> [channel] - Configure AP mode"},
+    {"wifi_config", cmd_wifi_config, "Show current WiFi configuration"},
+    {"wifi_apply", cmd_wifi_apply, "Apply WiFi configuration without reboot"},
+    {"wifi_save", cmd_wifi_save, "Save WiFi configuration to persistent storage"},
+    {"wifi_reset", cmd_wifi_reset, "Reset WiFi configuration to defaults"},
+    {"wifi_scan", cmd_wifi_scan, "Scan for available WiFi networks"},
+    {"wifi_scan_results", cmd_wifi_scan_results, "Show WiFi scan results"},
+    {"wifi_status", cmd_wifi_status, "Show detailed WiFi connection status"},
+    
+    // Special commands
     {"exit", NULL, "Disconnect from console"},
     {NULL, NULL, NULL}  // End of table marker
 };
@@ -109,7 +138,7 @@ static int parse_command(char *cmd_line, char **argv, int max_args)
 }
 
 // ==============================================
-// COMMAND HANDLERS
+// BASIC COMMAND HANDLERS
 // ==============================================
 
 static esp_err_t cmd_help(int socket, int argc, char **argv)
@@ -117,16 +146,35 @@ static esp_err_t cmd_help(int socket, int argc, char **argv)
     char response[RESPONSE_BUFFER_SIZE];
     
     snprintf(response, sizeof(response),
-             "\r\nEMG8x Console Commands:\r\n"
-             "======================\r\n");
+             "\r\n=== EMG8x Console Commands ===\r\n"
+             "\r\nBasic Commands:\r\n");
     telnet_send_response(socket, response);
     
     for (int i = 0; telnet_commands[i].cmd != NULL; i++) {
-        snprintf(response, sizeof(response),
-                 "%-10s - %s\r\n", telnet_commands[i].cmd, telnet_commands[i].help);
-        telnet_send_response(socket, response);
+        if (strncmp(telnet_commands[i].cmd, "wifi_", 5) != 0 && 
+            strcmp(telnet_commands[i].cmd, "wifi") != 0) {
+            snprintf(response, sizeof(response),
+                     "  %-12s - %s\r\n", telnet_commands[i].cmd, telnet_commands[i].help);
+            telnet_send_response(socket, response);
+        }
     }
-    telnet_send_response(socket, "\r\n");
+    
+    telnet_send_response(socket, "\r\nWiFi Commands:\r\n");
+    for (int i = 0; telnet_commands[i].cmd != NULL; i++) {
+        if (strncmp(telnet_commands[i].cmd, "wifi", 4) == 0) {
+            snprintf(response, sizeof(response),
+                     "  %-16s - %s\r\n", telnet_commands[i].cmd, telnet_commands[i].help);
+            telnet_send_response(socket, response);
+        }
+    }
+    
+    telnet_send_response(socket, 
+             "\r\nUsage Examples:\r\n"
+             "  wifi_set_sta MyWiFi password123\r\n"
+             "  wifi_set_ap EMG8x_Device mypassword 6\r\n"
+             "  wifi_apply\r\n"
+             "  wifi_save\r\n"
+             "\r\n");
     return ESP_OK;
 }
 
@@ -147,12 +195,14 @@ static esp_err_t cmd_status(int socket, int argc, char **argv)
              "Queue Head: %d\r\n"
              "Queue Tail: %d\r\n"
              "Free Heap: %" PRIu32 " bytes\r\n"
+             "Min Free Heap: %" PRIu32 " bytes\r\n"
              "\r\n",
              g_callbacks->get_block_counter ? g_callbacks->get_block_counter() : 0,
              g_callbacks->get_sample_count ? g_callbacks->get_sample_count() : 0,
              g_callbacks->get_queue_head ? g_callbacks->get_queue_head() : 0,
              g_callbacks->get_queue_tail ? g_callbacks->get_queue_tail() : 0,
-             g_callbacks->get_free_heap_size ? g_callbacks->get_free_heap_size() : 0);
+             g_callbacks->get_free_heap_size ? g_callbacks->get_free_heap_size() : 0,
+             g_callbacks->get_min_free_heap_size ? g_callbacks->get_min_free_heap_size() : 0);
     
     telnet_send_response(socket, response);
     return ESP_OK;
@@ -186,7 +236,7 @@ static esp_err_t cmd_info(int socket, int argc, char **argv)
              "Cores: %d\r\n"
              "Free Heap: %" PRIu32 " bytes\r\n"
              "Min Free Heap: %" PRIu32 " bytes\r\n"
-             "Uptime: %" PRIu64 " ms\r\n"
+             "Uptime: %" PRIu64 " ms (%.1f hours)\r\n"
 #if CONFIG_EMG8X_BOARD_EMULATION == 0
              "Mode: Hardware\r\n"
 #else
@@ -198,72 +248,24 @@ static esp_err_t cmd_info(int socket, int argc, char **argv)
              chip_info.cores,
              g_callbacks && g_callbacks->get_free_heap_size ? g_callbacks->get_free_heap_size() : 0,
              g_callbacks && g_callbacks->get_min_free_heap_size ? g_callbacks->get_min_free_heap_size() : 0,
-             uptime);
+             uptime,
+             uptime / 3600000.0);
     
     telnet_send_response(socket, response);
     return ESP_OK;
 }
 
-static esp_err_t cmd_wifi_info(int socket, int argc, char **argv)
+static esp_err_t cmd_reboot(int socket, int argc, char **argv)
 {
-    char response[RESPONSE_BUFFER_SIZE];
-    char current_ip[16] = "N/A";
-    
-    if (g_callbacks && g_callbacks->wifi_get_ip) {
-        g_callbacks->wifi_get_ip(current_ip, sizeof(current_ip));
-    }
-    
-    bool is_ap_mode = false;
-    if (g_callbacks && g_callbacks->wifi_is_ap_mode) {
-        is_ap_mode = g_callbacks->wifi_is_ap_mode();
-    }
-    
-    snprintf(response, sizeof(response),
-             "\r\nWiFi Information:\r\n"
-             "=================\r\n"
-             "Current Mode: %s\r\n"
-             "IP Address: %s\r\n"
-             "\r\n"
-             "Available Commands:\r\n"
-             "- Hold BOOT button for 3 sec to switch mode\r\n"
-             "- wifi_switch - Switch WiFi mode via command\r\n"
-             "\r\n"
-             "Modes:\r\n"
-             "- STA (Client): Connects to existing WiFi\r\n"
-             "- AP (Access Point): Creates WiFi hotspot\r\n"
-             "  SSID: EMG8x_Setup\r\n"
-             "  Password: emg8x123\r\n"
-             "  IP: 192.168.4.1\r\n"
-             "\r\n",
-             is_ap_mode ? "AP (Access Point)" : "STA (Client)",
-             current_ip);
-    
-    telnet_send_response(socket, response);
+    telnet_send_response(socket, "\r\nRebooting device in 3 seconds...\r\n\r\n");
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    esp_restart();
     return ESP_OK;
 }
 
-static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv)
-{
-    char response[RESPONSE_BUFFER_SIZE];
-    
-    if (g_callbacks == NULL || g_callbacks->wifi_switch_mode == NULL) {
-        telnet_send_response(socket, "\r\nError: WiFi switch not available\r\n\r\n");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    
-    bool is_ap_mode = g_callbacks->wifi_is_ap_mode ? g_callbacks->wifi_is_ap_mode() : false;
-    
-    snprintf(response, sizeof(response),
-             "\r\nSwitching WiFi mode from %s to %s\r\n"
-             "Device will reboot in 3 seconds...\r\n\r\n",
-             is_ap_mode ? "AP" : "STA",
-             is_ap_mode ? "STA" : "AP");
-    
-    telnet_send_response(socket, response);
-    
-    esp_err_t ret = g_callbacks->wifi_switch_mode();
-    return ret;
-}
+// ==============================================
+// ADC COMMAND HANDLERS
+// ==============================================
 
 static esp_err_t cmd_set_channel(int socket, int argc, char **argv)
 {
@@ -433,12 +435,332 @@ static esp_err_t cmd_start_stop(int socket, int argc, char **argv)
     return ret;
 }
 
-static esp_err_t cmd_reboot(int socket, int argc, char **argv)
+static esp_err_t cmd_wifi_info(int socket, int argc, char **argv)
 {
-    telnet_send_response(socket, "\r\nRebooting device in 3 seconds...\r\n\r\n");
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    esp_restart();
+    char response[RESPONSE_BUFFER_SIZE];
+    char current_ip[16] = "N/A";
+    
+    if (g_callbacks && g_callbacks->wifi_get_ip) {
+        g_callbacks->wifi_get_ip(current_ip, sizeof(current_ip));
+    }
+    
+    bool is_ap_mode = false;
+    if (g_callbacks && g_callbacks->wifi_is_ap_mode) {
+        is_ap_mode = g_callbacks->wifi_is_ap_mode();
+    }
+    
+    snprintf(response, sizeof(response),
+             "\r\nWiFi Information:\r\n"
+             "=================\r\n"
+             "Current Mode: %s\r\n"
+             "IP Address: %s\r\n"
+             "\r\n"
+             "Quick Commands:\r\n"
+             "- wifi_config     : Show current configuration\r\n"
+             "- wifi_scan       : Scan for networks\r\n"
+             "- wifi_status     : Detailed connection status\r\n"
+             "- wifi_set_sta <ssid> <pass> : Configure STA mode\r\n"
+             "- wifi_set_ap <ssid> <pass>  : Configure AP mode\r\n"
+             "- wifi_apply      : Apply config without reboot\r\n"
+             "- wifi_save       : Save config permanently\r\n"
+             "\r\n",
+             is_ap_mode ? "AP (Access Point)" : "STA (Client)",
+             current_ip);
+    
+    telnet_send_response(socket, response);
     return ESP_OK;
+}
+
+static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_switch_mode == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi switch not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    bool is_ap_mode = g_callbacks->wifi_is_ap_mode ? g_callbacks->wifi_is_ap_mode() : false;
+    
+    snprintf(response, sizeof(response),
+             "\r\nSwitching WiFi mode from %s to %s\r\n"
+             "Device will reboot in 3 seconds...\r\n\r\n",
+             is_ap_mode ? "AP" : "STA",
+             is_ap_mode ? "STA" : "AP");
+    
+    telnet_send_response(socket, response);
+    
+    esp_err_t ret = g_callbacks->wifi_switch_mode();
+    return ret;
+}
+
+static esp_err_t cmd_wifi_set_sta(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (argc < 3) {
+        snprintf(response, sizeof(response),
+                 "\r\nUsage: wifi_set_sta <ssid> <password>\r\n"
+                 "Example: wifi_set_sta MyWiFi mypassword123\r\n\r\n");
+        telnet_send_response(socket, response);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_set_sta_config == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi configuration not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    esp_err_t ret = g_callbacks->wifi_set_sta_config(argv[1], argv[2]);
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response),
+                 "\r\nSTA configuration updated:\r\n"
+                 "SSID: %s\r\n"
+                 "Password: %s\r\n"
+                 "\r\n"
+                 "Use 'wifi_apply' to apply without reboot or 'wifi_save' to save permanently.\r\n\r\n",
+                 argv[1], argv[2]);
+    } else {
+        snprintf(response, sizeof(response), "\r\nFailed to set STA configuration\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_set_ap(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (argc < 3) {
+        snprintf(response, sizeof(response),
+                 "\r\nUsage: wifi_set_ap <ssid> <password> [channel]\r\n"
+                 "Example: wifi_set_ap EMG8x_Device mypassword 6\r\n"
+                 "Channel range: 1-13 (default: 1)\r\n\r\n");
+        telnet_send_response(socket, response);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_set_ap_config == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi configuration not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    uint8_t channel = 1;  // Default channel
+    if (argc >= 4) {
+        int ch = atoi(argv[3]);
+        if (ch >= 1 && ch <= 13) {
+            channel = (uint8_t)ch;
+        } else {
+            snprintf(response, sizeof(response), "\r\nInvalid channel: %d (must be 1-13)\r\n\r\n", ch);
+            telnet_send_response(socket, response);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    
+    esp_err_t ret = g_callbacks->wifi_set_ap_config(argv[1], argv[2], channel);
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response),
+                 "\r\nAP configuration updated:\r\n"
+                 "SSID: %s\r\n"
+                 "Password: %s\r\n"
+                 "Channel: %d\r\n"
+                 "\r\n"
+                 "Use 'wifi_apply' to apply without reboot or 'wifi_save' to save permanently.\r\n\r\n",
+                 argv[1], argv[2], channel);
+    } else {
+        snprintf(response, sizeof(response), "\r\nFailed to set AP configuration\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_config(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_get_config == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi configuration not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    emg8x_wifi_config_t config;
+    esp_err_t ret = g_callbacks->wifi_get_config(&config);
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response),
+                 "\r\nCurrent WiFi Configuration:\r\n"
+                 "===========================\r\n"
+                 "Active Mode: %s\r\n"
+                 "\r\n"
+                 "STA (Client) Configuration:\r\n"
+                 "  SSID: %s\r\n"
+                 "  Password: %s\r\n"
+                 "\r\n"
+                 "AP (Access Point) Configuration:\r\n"
+                 "  SSID: %s\r\n"
+                 "  Password: %s\r\n"
+                 "  Channel: %d\r\n"
+                 "  Max Connections: %d\r\n"
+                 "\r\n",
+                 config.ap_mode ? "AP (Access Point)" : "STA (Client)",
+                 config.sta_ssid,
+                 config.sta_password,
+                 config.ap_ssid,
+                 config.ap_password,
+                 config.ap_channel,
+                 config.ap_max_connections);
+    } else {
+        snprintf(response, sizeof(response), "\r\nFailed to get WiFi configuration\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_apply(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_apply_config == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi apply not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    telnet_send_response(socket, "\r\nApplying WiFi configuration...\r\n");
+    
+    esp_err_t ret = g_callbacks->wifi_apply_config();
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response), "\r\nWiFi configuration applied successfully\r\n\r\n");
+    } else {
+        snprintf(response, sizeof(response), "\r\nFailed to apply WiFi configuration\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_save(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_save_config == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi save not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    esp_err_t ret = g_callbacks->wifi_save_config();
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response), "\r\nWiFi configuration saved permanently\r\n\r\n");
+    } else {
+        snprintf(response, sizeof(response), "\r\nFailed to save WiFi configuration\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_reset(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_reset_config == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi reset not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    esp_err_t ret = g_callbacks->wifi_reset_config();
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response), 
+                 "\r\nWiFi configuration reset to defaults\r\n"
+                 "Use 'wifi_config' to see current settings\r\n\r\n");
+    } else {
+        snprintf(response, sizeof(response), "\r\nFailed to reset WiFi configuration\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_scan(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_scan_networks == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi scan not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    telnet_send_response(socket, "\r\nScanning for WiFi networks...\r\n");
+    
+    esp_err_t ret = g_callbacks->wifi_scan_networks();
+    
+    if (ret == ESP_OK) {
+        snprintf(response, sizeof(response), 
+                 "\r\nScan completed. Use 'wifi_scan_results' to see networks.\r\n\r\n");
+    } else {
+        snprintf(response, sizeof(response), "\r\nWiFi scan failed\r\n\r\n");
+    }
+    
+    telnet_send_response(socket, response);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_scan_results(int socket, int argc, char **argv)
+{
+    if (g_callbacks == NULL || g_callbacks->wifi_get_scan_results == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi scan results not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    char *scan_buffer = malloc(2048);  // Larger buffer for scan results
+    if (scan_buffer == NULL) {
+        telnet_send_response(socket, "\r\nError: Out of memory\r\n\r\n");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    telnet_send_response(socket, "\r\nAvailable WiFi Networks:\r\n========================\r\n");
+    
+    esp_err_t ret = g_callbacks->wifi_get_scan_results(scan_buffer, 2048);
+    
+    if (ret == ESP_OK) {
+        telnet_send_response(socket, scan_buffer);
+        telnet_send_response(socket, "\r\n");
+    } else {
+        telnet_send_response(socket, "\r\nFailed to get scan results\r\n\r\n");
+    }
+    
+    free(scan_buffer);
+    return ret;
+}
+
+static esp_err_t cmd_wifi_status(int socket, int argc, char **argv)
+{
+    char response[RESPONSE_BUFFER_SIZE];
+    
+    if (g_callbacks == NULL || g_callbacks->wifi_get_connection_info == NULL) {
+        telnet_send_response(socket, "\r\nError: WiFi status not available\r\n\r\n");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    
+    telnet_send_response(socket, "\r\nWiFi Connection Status:\r\n=======================\r\n");
+    
+    esp_err_t ret = g_callbacks->wifi_get_connection_info(response, sizeof(response));
+    
+    if (ret == ESP_OK) {
+        telnet_send_response(socket, response);
+        telnet_send_response(socket, "\r\n");
+    } else {
+        telnet_send_response(socket, "\r\nFailed to get connection info\r\n\r\n");
+    }
+    
+    return ret;
 }
 
 // ==============================================
@@ -628,8 +950,9 @@ void telnet_console_task(void *pvParameter)
                     send(new_socket, telnet_init, sizeof(telnet_init), 0);
                     
                     telnet_send_response(new_socket,
-                                       "\r\nWelcome to EMG8x Console!\r\n"
-                                       "Type 'help' for available commands.\r\n");
+                                       "\r\n=== Welcome to EMG8x Console! ===\r\n"
+                                       "Type 'help' for available commands.\r\n"
+                                       "Type 'wifi' for WiFi quick commands.\r\n");
                     send_prompt(new_socket);
                 } else {
                     telnet_send_response(new_socket,
@@ -692,7 +1015,7 @@ esp_err_t telnet_console_init(const console_callbacks_t *callbacks)
     g_telnet_server_socket = -1;
     g_telnet_task_handle = NULL;
     
-    ESP_LOGI(TAG, "Telnet console initialized");
+    ESP_LOGI(TAG, "Telnet console initialized with enhanced WiFi commands");
     return ESP_OK;
 }
 
@@ -712,7 +1035,7 @@ esp_err_t telnet_console_start(void)
     BaseType_t result = xTaskCreatePinnedToCore(
         &telnet_console_task,
         "telnet_console_task",
-        4096,
+        6144,  // Increased stack size for enhanced features
         NULL,
         tskIDLE_PRIORITY + 3,
         &g_telnet_task_handle,
@@ -724,7 +1047,7 @@ esp_err_t telnet_console_start(void)
         return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "Telnet console started successfully");
+    ESP_LOGI(TAG, "Enhanced telnet console started successfully");
     return ESP_OK;
 }
 

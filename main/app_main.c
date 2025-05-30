@@ -575,66 +575,221 @@ static esp_err_t console_adc_set_channel(int channel, int gain, int mode)
 }
 #endif
 
-// Системные callback функции
+// Системные callback функции/**
+
 static uint32_t console_get_block_counter(void)
 {
     return drdy_thread_context.blockCounter;
 }
 
+/**
+ * @brief Get current sample count within the current block
+ */
 static int console_get_sample_count(void)
 {
     return drdy_thread_context.sampleCount;
 }
 
+/**
+ * @brief Get current queue head position
+ */
 static int console_get_queue_head(void)
 {
     return drdy_thread_context.head;
 }
 
+/**
+ * @brief Get current queue tail position
+ */
 static int console_get_queue_tail(void)
 {
     return drdy_thread_context.tail;
 }
 
+/**
+ * @brief Get current free heap size
+ */
 static uint32_t console_get_free_heap_size(void)
 {
     return esp_get_free_heap_size();
 }
 
+/**
+ * @brief Get minimum free heap size since boot
+ */
 static uint32_t console_get_min_free_heap_size(void)
 {
     return esp_get_minimum_free_heap_size();
 }
 
+/**
+ * @brief Get system uptime in milliseconds
+ */
 static uint64_t console_get_uptime_ms(void)
 {
     return esp_timer_get_time() / 1000;
 }
 
-// WiFi callback функции
+// ==============================================
+// BASIC WIFI CALLBACK FUNCTIONS
+// ==============================================
+
+/**
+ * @brief Check if WiFi is currently in AP mode
+ */
 static bool console_wifi_is_ap_mode(void)
 {
     return wifi_manager_is_ap_mode();
 }
 
+/**
+ * @brief Get current IP address
+ */
 static esp_err_t console_wifi_get_ip(char *buffer, size_t size)
 {
+    if (buffer == NULL || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
     return wifi_manager_get_ip(buffer, size);
 }
 
+/**
+ * @brief Switch WiFi mode (STA <-> AP) with reboot
+ */
 static esp_err_t console_wifi_switch_mode(void)
 {
     return wifi_manager_switch_mode();
 }
+
+// ==============================================
+// ENHANCED WIFI CONFIGURATION CALLBACK FUNCTIONS
+// ==============================================
+
+/**
+ * @brief Set STA (client) mode configuration
+ */
+static esp_err_t console_wifi_set_sta_config(const char *ssid, const char *password)
+{
+    if (ssid == NULL || password == NULL) {
+        ESP_LOGE(TAG, "console_wifi_set_sta_config: NULL parameters");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Setting STA config: SSID=%s", ssid);
+    return wifi_manager_set_sta_config(ssid, password);
+}
+
+/**
+ * @brief Set AP (access point) mode configuration
+ */
+static esp_err_t console_wifi_set_ap_config(const char *ssid, const char *password, uint8_t channel)
+{
+    if (ssid == NULL || password == NULL) {
+        ESP_LOGE(TAG, "console_wifi_set_ap_config: NULL parameters");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (channel < 1 || channel > 13) {
+        ESP_LOGE(TAG, "console_wifi_set_ap_config: Invalid channel %d", channel);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    ESP_LOGI(TAG, "Setting AP config: SSID=%s, Channel=%d", ssid, channel);
+    return wifi_manager_set_ap_config(ssid, password, channel);
+}
+
+/**
+ * @brief Get current WiFi configuration
+ */
+static esp_err_t console_wifi_get_config(emg8x_wifi_config_t *config)
+{
+    if (config == NULL) {
+        ESP_LOGE(TAG, "console_wifi_get_config: NULL config parameter");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    return wifi_manager_get_config(config);
+}
+
+/**
+ * @brief Apply WiFi configuration changes without reboot
+ */
+static esp_err_t console_wifi_apply_config(void)
+{
+    ESP_LOGI(TAG, "Applying WiFi configuration changes");
+    return wifi_manager_apply_config();
+}
+
+/**
+ * @brief Save WiFi configuration to persistent storage
+ */
+static esp_err_t console_wifi_save_config(void)
+{
+    ESP_LOGI(TAG, "Saving WiFi configuration to NVS");
+    return wifi_manager_save_config();
+}
+
+/**
+ * @brief Reset WiFi configuration to factory defaults
+ */
+static esp_err_t console_wifi_reset_config(void)
+{
+    ESP_LOGI(TAG, "Resetting WiFi configuration to defaults");
+    return wifi_manager_reset_config();
+}
+
+/**
+ * @brief Scan for available WiFi networks
+ */
+static esp_err_t console_wifi_scan_networks(void)
+{
+    ESP_LOGI(TAG, "Starting WiFi network scan");
+    return wifi_manager_scan_networks();
+}
+
+/**
+ * @brief Get WiFi scan results
+ */
+static esp_err_t console_wifi_get_scan_results(char *buffer, size_t size)
+{
+    if (buffer == NULL || size == 0) {
+        ESP_LOGE(TAG, "console_wifi_get_scan_results: Invalid buffer parameters");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    return wifi_manager_get_scan_results(buffer, size);
+}
+
+/**
+ * @brief Get detailed WiFi connection information
+ */
+static esp_err_t console_wifi_get_connection_info(char *buffer, size_t size)
+{
+    if (buffer == NULL || size == 0) {
+        ESP_LOGE(TAG, "console_wifi_get_connection_info: Invalid buffer parameters");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    return wifi_manager_get_connection_info(buffer, size);
+}
+
+// ==============================================
+// UPDATED CONSOLE CALLBACKS STRUCTURE
+// ==============================================
+
+/**
+ * @brief Complete console callbacks structure with all required functions
+ * Replace your existing console_callbacks declaration with this one
+ */
 static const console_callbacks_t console_callbacks = {
-    // ADC operations
+    // ADC/Hardware operations
     .adc_read_reg = console_adc_read_reg,
     .adc_write_reg = console_adc_write_reg,
     .adc_reset = console_adc_reset,
     .adc_start_stop = console_adc_start_stop,
     .adc_set_channel = console_adc_set_channel,
     
-    // System status
+    // System status information
     .get_block_counter = console_get_block_counter,
     .get_sample_count = console_get_sample_count,
     .get_queue_head = console_get_queue_head,
@@ -643,10 +798,21 @@ static const console_callbacks_t console_callbacks = {
     .get_min_free_heap_size = console_get_min_free_heap_size,
     .get_uptime_ms = console_get_uptime_ms,
     
-    // WiFi operations
+    // Basic WiFi operations
     .wifi_is_ap_mode = console_wifi_is_ap_mode,
     .wifi_get_ip = console_wifi_get_ip,
     .wifi_switch_mode = console_wifi_switch_mode,
+    
+    // Enhanced WiFi configuration operations
+    .wifi_set_sta_config = console_wifi_set_sta_config,
+    .wifi_set_ap_config = console_wifi_set_ap_config,
+    .wifi_get_config = console_wifi_get_config,
+    .wifi_apply_config = console_wifi_apply_config,
+    .wifi_save_config = console_wifi_save_config,
+    .wifi_reset_config = console_wifi_reset_config,
+    .wifi_scan_networks = console_wifi_scan_networks,
+    .wifi_get_scan_results = console_wifi_get_scan_results,
+    .wifi_get_connection_info = console_wifi_get_connection_info,
 };
 static void emg8x_app_start(void)
 {

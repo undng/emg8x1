@@ -45,9 +45,17 @@ static void wifi_init_sta_mode(void);
 static void wifi_event_handler_ap(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 
-// ============================================
-// PUBLIC API IMPLEMENTATION
-// ============================================
+static emg8x_wifi_config_t g_wifi_config = {
+    .sta_ssid = CONFIG_WIFI_SSID,
+    .sta_password = CONFIG_WIFI_PASSWORD,
+    .ap_ssid = AP_MODE_SSID,
+    .ap_password = AP_MODE_PASSWORD,
+    .ap_mode = false,
+    .ap_channel = 1,
+    .ap_max_connections = 4
+};
+
+
 
 esp_err_t wifi_manager_init(void) {
     ESP_LOGI(TAG, "Initializing WiFi Manager");
@@ -362,4 +370,130 @@ static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base, int32
         g_retry_count = 0;
         xEventGroupSetBits(g_wifi_event_group, WIFI_CONNECTED_BIT);
     }
+}
+
+
+
+esp_err_t wifi_manager_set_sta_config(const char *ssid, const char *password) {
+    if (ssid == NULL || password == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (strlen(ssid) >= MAX_SSID_LEN || strlen(password) >= MAX_PASSWORD_LEN) {
+        ESP_LOGE(TAG, "SSID or password too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    
+    strncpy(g_wifi_config.sta_ssid, ssid, MAX_SSID_LEN - 1);
+    g_wifi_config.sta_ssid[MAX_SSID_LEN - 1] = '\0';
+    
+    strncpy(g_wifi_config.sta_password, password, MAX_PASSWORD_LEN - 1);
+    g_wifi_config.sta_password[MAX_PASSWORD_LEN - 1] = '\0';
+    
+    ESP_LOGI(TAG, "STA config updated: SSID=%s", ssid);
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_set_ap_config(const char *ssid, const char *password, uint8_t channel) {
+    if (ssid == NULL || password == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (strlen(ssid) >= MAX_SSID_LEN || strlen(password) >= MAX_PASSWORD_LEN) {
+        ESP_LOGE(TAG, "SSID or password too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    
+    if (channel < 1 || channel > 13) {
+        ESP_LOGE(TAG, "Invalid channel: %d (must be 1-13)", channel);
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    strncpy(g_wifi_config.ap_ssid, ssid, MAX_SSID_LEN - 1);
+    g_wifi_config.ap_ssid[MAX_SSID_LEN - 1] = '\0';
+    
+    strncpy(g_wifi_config.ap_password, password, MAX_PASSWORD_LEN - 1);
+    g_wifi_config.ap_password[MAX_PASSWORD_LEN - 1] = '\0';
+    
+    g_wifi_config.ap_channel = channel;
+    
+    ESP_LOGI(TAG, "AP config updated: SSID=%s, Channel=%d", ssid, channel);
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_get_config(emg8x_wifi_config_t *config) {
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    memcpy(config, &g_wifi_config, sizeof(emg8x_wifi_config_t));
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_apply_config(void) {
+    ESP_LOGI(TAG, "wifi_manager_apply_config: Not yet implemented (stub)");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t wifi_manager_save_config(void) {
+    ESP_LOGI(TAG, "wifi_manager_save_config: Not yet implemented (stub)");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t wifi_manager_load_config(void) {
+    ESP_LOGI(TAG, "wifi_manager_load_config: Not yet implemented (stub)");
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_reset_config(void) {
+    ESP_LOGI(TAG, "wifi_manager_reset_config: Not yet implemented (stub)");
+    
+    // Reset to default values
+    strncpy(g_wifi_config.sta_ssid, CONFIG_WIFI_SSID, MAX_SSID_LEN - 1);
+    strncpy(g_wifi_config.sta_password, CONFIG_WIFI_PASSWORD, MAX_PASSWORD_LEN - 1);
+    strncpy(g_wifi_config.ap_ssid, AP_MODE_SSID, MAX_SSID_LEN - 1);
+    strncpy(g_wifi_config.ap_password, AP_MODE_PASSWORD, MAX_PASSWORD_LEN - 1);
+    g_wifi_config.ap_mode = false;
+    g_wifi_config.ap_channel = 1;
+    g_wifi_config.ap_max_connections = 4;
+    
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_scan_networks(void) {
+    ESP_LOGI(TAG, "wifi_manager_scan_networks: Not yet implemented (stub)");
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t wifi_manager_get_scan_results(char *buffer, size_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    strncpy(buffer, "No scan results available (stub implementation)\n"
+                   "Use the enhanced wifi_manager.c for full functionality.\n", 
+            buffer_size - 1);
+    buffer[buffer_size - 1] = '\0';
+    
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_get_connection_info(char *buffer, size_t buffer_size) {
+    if (buffer == NULL || buffer_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    char current_ip[16];
+    wifi_manager_get_ip(current_ip, sizeof(current_ip));
+    
+    snprintf(buffer, buffer_size,
+             "Mode: %s\r\n"
+             "SSID: %s\r\n"
+             "IP: %s\r\n"
+             "Status: Stub implementation\r\n",
+             g_wifi_config.ap_mode ? "AP (Access Point)" : "STA (Client)",
+             g_wifi_config.ap_mode ? g_wifi_config.ap_ssid : g_wifi_config.sta_ssid,
+             current_ip);
+             
+    return ESP_OK;
 }

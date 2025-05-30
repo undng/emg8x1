@@ -6,6 +6,8 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "wifi_manager.h"
+// Forward declaration to avoid circular dependency
 
 // ==============================================
 // TELNET CONSOLE CONFIGURATION
@@ -14,7 +16,7 @@
 #define TELNET_PORT                     23
 #define MAX_CLIENTS                     2
 #define CMD_BUFFER_SIZE                 256
-#define RESPONSE_BUFFER_SIZE            512
+#define RESPONSE_BUFFER_SIZE            1024  // Increased for scan results
 
 // ==============================================
 // DATA STRUCTURES
@@ -123,7 +125,7 @@ typedef struct {
      */
     int (*get_queue_tail)(void);
     
-    // WiFi operations
+    // Basic WiFi operations (existing)
     /**
      * @brief Check if WiFi is in AP mode
      * @return true if in AP mode, false if in STA mode
@@ -143,6 +145,71 @@ typedef struct {
      * @return ESP_OK on success
      */
     esp_err_t (*wifi_switch_mode)(void);
+    
+    // Enhanced WiFi operations (new)
+    /**
+     * @brief Set STA (client) mode configuration
+     * @param ssid Network SSID
+     * @param password Network password
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_set_sta_config)(const char *ssid, const char *password);
+    
+    /**
+     * @brief Set AP (access point) mode configuration
+     * @param ssid Access point SSID
+     * @param password Access point password
+     * @param channel WiFi channel (1-13)
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_set_ap_config)(const char *ssid, const char *password, uint8_t channel);
+    
+    /**
+     * @brief Get current WiFi configuration
+     * @param config Pointer to store configuration
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_get_config)(emg8x_wifi_config_t *config);
+    
+    /**
+     * @brief Apply WiFi configuration without reboot
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_apply_config)(void);
+    
+    /**
+     * @brief Save WiFi configuration to persistent storage
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_save_config)(void);
+    
+    /**
+     * @brief Reset WiFi configuration to defaults
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_reset_config)(void);
+    
+    /**
+     * @brief Scan for available WiFi networks
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_scan_networks)(void);
+    
+    /**
+     * @brief Get WiFi scan results
+     * @param buffer Buffer to store scan results
+     * @param size Buffer size
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_get_scan_results)(char *buffer, size_t size);
+    
+    /**
+     * @brief Get WiFi connection information
+     * @param buffer Buffer to store connection info
+     * @param size Buffer size
+     * @return ESP_OK on success
+     */
+    esp_err_t (*wifi_get_connection_info)(char *buffer, size_t size);
     
     // System operations
     /**
@@ -243,8 +310,8 @@ void telnet_console_task(void *pvParameter);
 #error "Invalid CMD_BUFFER_SIZE: must be between 64 and 1024"
 #endif
 
-#if RESPONSE_BUFFER_SIZE < 128 || RESPONSE_BUFFER_SIZE > 2048
-#error "Invalid RESPONSE_BUFFER_SIZE: must be between 128 and 2048"
+#if RESPONSE_BUFFER_SIZE < 128 || RESPONSE_BUFFER_SIZE > 4096
+#error "Invalid RESPONSE_BUFFER_SIZE: must be between 128 and 4096"
 #endif
 
 #endif // TELNET_CONSOLE_H
