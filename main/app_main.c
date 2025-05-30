@@ -53,6 +53,7 @@
 
 #include "esp_chip_info.h"
 #include "esp_timer.h" // Для esp_timer_get_time()
+#include "wifi_manager.h"
 
 spi_device_handle_t spi_dev;
 
@@ -98,18 +99,10 @@ static esp_err_t cmd_start_stop(int socket, int argc, char **argv);
 static esp_err_t cmd_reboot(int socket, int argc, char **argv);
 static esp_err_t cmd_info(int socket, int argc, char **argv);
 
-// Константы для переключения режимов
-#define WIFI_MODE_BUTTON_PIN GPIO_NUM_0 // BOOT кнопка на NodeMCU
-#define BUTTON_PRESS_TIME_MS 3000       // 3 секунды удержания для переключения
-#define AP_MODE_IP "192.168.4.1"        // Фиксированный IP в режиме AP
-#define AP_MODE_SSID "EMG8x_Setup"      // Имя точки доступа
-#define AP_MODE_PASSWORD "emg8x123"     // Пароль точки доступа
 
-// Глобальные переменные для WiFi
-static bool wifi_ap_mode = false; // false = STA, true = AP
-static int button_press_start_time = 0;
-static bool button_was_pressed = false;
-static TaskHandle_t wifiModeTaskHandle;
+
+
+
 
 static const char *TAG = "EMG8x";
 
@@ -257,201 +250,6 @@ typedef struct
 } type_tcp_server_thread_context;
 DRAM_ATTR type_tcp_server_thread_context tcp_server_thread_context;
 
-// #if CONFIG_WIFI_MODE_SOFTAP
-
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
-{
-    if (event_id == WIFI_EVENT_AP_STACONNECTED)
-    {
-        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG, "station %02x:%02x:%02x:%02x:%02x:%02x join, AID=%d",
-                 event->mac[0], event->mac[1], event->mac[2],
-                 event->mac[3], event->mac[4], event->mac[5],
-                 event->aid);
-    }
-    else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
-    {
-        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGI(TAG, "station %02x:%02x:%02x:%02x:%02x:%02x leave, AID=%d",
-                 event->mac[0], event->mac[1], event->mac[2],
-                 event->mac[3], event->mac[4], event->mac[5],
-                 event->aid);
-    }
-}
-esp_netif_ip_info_t ap_ip_info;
-void wifi_init_softap(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = CONFIG_WIFI_SSID,
-            .ssid_len = strlen(CONFIG_WIFI_SSID),
-            .channel = CONFIG_WIFI_CHANNEL,
-            .password = CONFIG_WIFI_PASSWORD,
-            .max_connection = CONFIG_MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK},
-    };
-
-    if (strlen(CONFIG_WIFI_PASSWORD) == 0)
-    {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-    }
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
-             CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD, CONFIG_WIFI_CHANNEL);
-
-    // Get default netif object
-    esp_netif_t *esp_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (esp_netif)
-    {
-        ESP_ERROR_CHECK(esp_netif_get_ip_info(esp_netif, &ap_ip_info));
-        strncpy(tcp_server_thread_context.serverIpAddr, ipaddr_ntoa((const ip_addr_t *)&ap_ip_info.ip), 127);
-        ESP_LOGI(TAG, "local AP address is: %s\n", tcp_server_thread_context.serverIpAddr);
-    }
-
-    // strncpy(tcp_server_thread_context.serverIpAddr, ipaddr_ntoa(&gnetif.ip_addr), 127) ;
-    // ESP_LOGI(TAG, ipaddr_ntoa(gnetif.ip_addr.addr) )
-    // ESP_LOGI(TAG, "local address: %s\n", tcp_server_thread_context.serverIpAddr ) ;
-}
-
-// #else
-
-/* FreeRTOS event group to signal when we are connected*/
-static EventGroupHandle_t s_wifi_event_group;
-
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT BIT1
-#define EXAMPLE_ESP_MAXIMUM_RETRY 10
-
-static int s_retry_num = 0;
-
-static void event_handler(void *arg, esp_event_base_t event_base,
-                          int32_t event_id, void *event_data)
-{
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-    {
-        esp_wifi_connect();
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY)
-        {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
-        }
-        else
-        {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        }
-        ESP_LOGI(TAG, "connect to the AP fail");
-    }
-    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        strncpy(tcp_server_thread_context.serverIpAddr, ipaddr_ntoa((const ip_addr_t *)&event->ip_info.ip), 127);
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-// static void wifi_init(void)
-// {
-//     s_wifi_event_group = xEventGroupCreate() ;
-
-//     ESP_ERROR_CHECK(esp_netif_init()) ;
-
-//     ESP_ERROR_CHECK(esp_event_loop_create_default()) ;
-//     esp_netif_create_default_wifi_sta() ;
-
-//     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT() ;
-//     ESP_ERROR_CHECK(esp_wifi_init(&cfg)) ;
-
-//     esp_event_handler_instance_t instance_any_id ;
-//     esp_event_handler_instance_t instance_got_ip ;
-//     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-//                                                         ESP_EVENT_ANY_ID,
-//                                                         &event_handler,
-//                                                         NULL,
-//                                                         &instance_any_id)) ;
-//     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-//                                                         IP_EVENT_STA_GOT_IP,
-//                                                         &event_handler,
-//                                                         NULL,
-//                                                         &instance_got_ip)) ;
-
-//     wifi_config_t wifi_config = {
-//         .sta = {
-//             .ssid = CONFIG_WIFI_SSID,
-//             .password = CONFIG_WIFI_PASSWORD,
-//             /* Setting a password implies station will connect to all security modes including WEP/WPA.
-//              * However these modes are deprecated and not advisable to be used. Incase your Access point
-//              * doesn't support WPA2, these mode can be enabled by commenting below line */
-// 	     .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-
-//             .pmf_cfg = {
-//                 .capable = true,
-//                 .required = false
-//             },
-//         },
-//     };
-//     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-//     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
-//     ESP_ERROR_CHECK(esp_wifi_start() );
-
-//     ESP_LOGI(TAG, "wifi_init_sta finished.");
-
-//     /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-//      * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-//     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-//             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-//             pdFALSE,
-//             pdFALSE,
-//             portMAX_DELAY);
-
-//     /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-//      * happened. */
-//     if (bits & WIFI_CONNECTED_BIT) {
-//         ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-//                  CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD ) ;
-// #if CONFIG_EMG8X_BOARD_REV == 4
-//         gpio_set_level( BOARD_LED1,     1 ) ;
-// #endif
-
-//     } else if (bits & WIFI_FAIL_BIT) {
-//         ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-//                  CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD ) ;
-//     } else {
-//         ESP_LOGE(TAG, "UNEXPECTED EVENT") ;
-//     }
-
-//     /* The event will not be processed after unregister */
-//     ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip));
-//     ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id));
-//     vEventGroupDelete(s_wifi_event_group);
-// }
-// #endif
 
 #if CONFIG_EMG8X_BOARD_EMULATION == 0
 // send 8bit command
@@ -628,8 +426,10 @@ void tcp_server_task(void *pvParameter)
             continue;
         }
 
-        ESP_LOGI(TAG, "TCP server started at %s, listen on the port: %d, at CpuCore%1d\n", pTcpServerContext->serverIpAddr, CONFIG_EMG8X_TCP_SERVER_PORT, xPortGetCoreID());
-
+    char current_ip[16];
+    wifi_manager_get_ip(current_ip, sizeof(current_ip));
+    ESP_LOGI(TAG, "TCP server started at %s, listen on the port: %d", 
+             current_ip, CONFIG_EMG8X_TCP_SERVER_PORT);
         // data transfer cycle
         while (1)
         {
@@ -1132,291 +932,15 @@ IRAM_ATTR void spi_data_pump_task(void *pvParameter)
     }
 }
 
-// ==============================================
-// ИСПРАВЛЕНИЯ ОШИБОК КОМПИЛЯЦИИ
-// ==============================================
 
-// 1. ДОБАВИТЬ В НАЧАЛО main.c (после существующих includes):
-#include "esp_timer.h" // Для esp_timer_get_time()
 
-// 2. ИСПРАВЛЕННЫЕ ФУНКЦИИ (заменить в коде):
 
-// Функция для сохранения режима WiFi в NVS
-static void save_wifi_mode(bool ap_mode)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("emg8x", NVS_READWRITE, &nvs_handle);
-    if (err == ESP_OK)
-    {
-        nvs_set_u8(nvs_handle, "wifi_ap_mode", ap_mode ? 1 : 0);
-        nvs_commit(nvs_handle);
-        nvs_close(nvs_handle);
-        ESP_LOGI("EMG8x", "WiFi mode saved: %s", ap_mode ? "AP" : "STA"); // Используем константу вместо TAG
-    }
-}
 
-// Функция для загрузки режима WiFi из NVS
-static bool load_wifi_mode(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("emg8x", NVS_READONLY, &nvs_handle);
-    if (err == ESP_OK)
-    {
-        uint8_t mode = 0;
-        err = nvs_get_u8(nvs_handle, "wifi_ap_mode", &mode);
-        nvs_close(nvs_handle);
-        if (err == ESP_OK)
-        {
-            ESP_LOGI("EMG8x", "WiFi mode loaded: %s", mode ? "AP" : "STA");
-            return mode != 0;
-        }
-    }
-    ESP_LOGI("EMG8x", "WiFi mode not found, using default: STA");
-    return false; // По умолчанию STA режим
-}
 
-// Функция мигания светодиодом для индикации режима
-static void indicate_wifi_mode(bool ap_mode)
-{
-    // AP режим: быстрое мигание (3 раза)
-    // STA режим: медленное мигание (1 раз)
-    int blink_count = ap_mode ? 3 : 1;
-    int blink_delay = ap_mode ? 200 : 500;
 
-    for (int i = 0; i < blink_count; i++)
-    {
-        gpio_set_level(GPIO_NUM_2, 1); // Используем GPIO_NUM_2 вместо ESP_LED1
-        vTaskDelay(blink_delay / portTICK_PERIOD_MS);
-        gpio_set_level(GPIO_NUM_2, 0);
-        vTaskDelay(blink_delay / portTICK_PERIOD_MS);
-    }
-}
 
-// WiFi для AP режима
-static void wifi_init_ap_mode(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
 
-    // Настройка IP адреса для AP
-    esp_netif_ip_info_t ip_info;
-    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
-    esp_netif_dhcps_stop(ap_netif);
-    esp_netif_set_ip_info(ap_netif, &ip_info);
-    esp_netif_dhcps_start(ap_netif);
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = AP_MODE_SSID,
-            .ssid_len = strlen(AP_MODE_SSID),
-            .channel = 1,
-            .password = AP_MODE_PASSWORD,
-            .max_connection = 4,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK},
-    };
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    strncpy(tcp_server_thread_context.serverIpAddr, AP_MODE_IP, 127);
-
-    ESP_LOGI("EMG8x", "WiFi AP Mode started:");
-    ESP_LOGI("EMG8x", "  SSID: %s", AP_MODE_SSID);
-    ESP_LOGI("EMG8x", "  Password: %s", AP_MODE_PASSWORD);
-    ESP_LOGI("EMG8x", "  IP: %s", AP_MODE_IP);
-    ESP_LOGI("EMG8x", "  Telnet: telnet %s", AP_MODE_IP);
-}
-
-// Объявление функции wifi_init (добавить перед использованием)
-#if CONFIG_WIFI_MODE_SOFTAP
-void wifi_init_softap(void); // Объявление существующей функции
-#define wifi_init_sta_mode wifi_init_softap
-#else
-static void wifi_init_sta_mode(void); // Объявление для STA режима
-#endif
-
-// WiFi для STA режима
-#if !CONFIG_WIFI_MODE_SOFTAP
-static void wifi_init_sta_mode(void)
-{
-    // Используем существующий код wifi_init() из main.c
-    // Копируем содержимое функции wifi_init() сюда
-    s_wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = CONFIG_WIFI_SSID,
-            .password = CONFIG_WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .pmf_cfg = {
-                .capable = true,
-                .required = false},
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI("EMG8x", "wifi_init_sta finished.");
-
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           portMAX_DELAY);
-
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-        ESP_LOGI("EMG8x", "connected to ap SSID:%s password:%s",
-                 CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD);
-#if CONFIG_EMG8X_BOARD_REV == 4
-        gpio_set_level(BOARD_LED1, 1);
-#endif
-    }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-        ESP_LOGI("EMG8x", "Failed to connect to SSID:%s, password:%s",
-                 CONFIG_WIFI_SSID, CONFIG_WIFI_PASSWORD);
-    }
-    else
-    {
-        ESP_LOGE("EMG8x", "UNEXPECTED EVENT");
-    }
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip));
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id));
-    vEventGroupDelete(s_wifi_event_group);
-}
-#endif
-
-// Задача мониторинга кнопки
-void wifi_mode_button_task(void *pvParameter)
-{
-    ESP_LOGI("EMG8x", "WiFi mode button task started");
-
-    while (1)
-    {
-        // Проверяем состояние кнопки (активный уровень - LOW)
-        if (gpio_get_level(WIFI_MODE_BUTTON_PIN) == 0)
-        {
-            // Кнопка нажата
-            if (!button_was_pressed)
-            {
-                button_was_pressed = true;
-                button_press_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                ESP_LOGI("EMG8x", "Button pressed, waiting for %d ms...", BUTTON_PRESS_TIME_MS);
-            }
-            else
-            {
-                // Проверяем время удержания
-                int current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                if ((current_time - button_press_start_time) >= BUTTON_PRESS_TIME_MS)
-                {
-                    // Кнопка удерживалась достаточно долго
-                    ESP_LOGI("EMG8x", "Button held for %d ms - switching WiFi mode", BUTTON_PRESS_TIME_MS);
-
-                    // Переключаем режим
-                    wifi_ap_mode = !wifi_ap_mode;
-                    save_wifi_mode(wifi_ap_mode);
-
-                    // Индикация переключения
-                    indicate_wifi_mode(wifi_ap_mode);
-
-                    ESP_LOGI("EMG8x", "WiFi mode will be: %s after reboot",
-                             wifi_ap_mode ? "AP (Access Point)" : "STA (Client)");
-
-                    // Перезагружаемся для применения нового режима
-                    vTaskDelay(2000 / portTICK_PERIOD_MS);
-                    esp_restart();
-                }
-            }
-        }
-        else
-        {
-            // Кнопка отпущена
-            if (button_was_pressed)
-            {
-                int press_duration = xTaskGetTickCount() * portTICK_PERIOD_MS - button_press_start_time;
-                if (press_duration < BUTTON_PRESS_TIME_MS)
-                {
-                    ESP_LOGI("EMG8x", "Button released after %d ms (too short)", press_duration);
-                }
-                button_was_pressed = false;
-            }
-        }
-
-        vTaskDelay(100 / portTICK_PERIOD_MS); // Проверяем каждые 100ms
-    }
-}
-
-// Инициализация кнопки и WiFi режима
-static void init_wifi_mode_system(void)
-{
-    // Настройка кнопки
-    gpio_reset_pin(WIFI_MODE_BUTTON_PIN);
-    gpio_set_direction(WIFI_MODE_BUTTON_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(WIFI_MODE_BUTTON_PIN, GPIO_PULLUP_ONLY);
-
-    // Загружаем сохраненный режим WiFi
-    wifi_ap_mode = load_wifi_mode();
-
-    ESP_LOGI("EMG8x", "WiFi mode: %s", wifi_ap_mode ? "AP (Access Point)" : "STA (Client)");
-
-    // Индикация текущего режима при загрузке
-    indicate_wifi_mode(wifi_ap_mode);
-
-    // Запускаем соответствующий WiFi режим
-    if (wifi_ap_mode)
-    {
-        wifi_init_ap_mode();
-    }
-    else
-    {
-#if CONFIG_WIFI_MODE_SOFTAP
-        wifi_init_softap();
-#else
-        wifi_init_sta_mode();
-#endif
-    }
-
-    // Запускаем задачу мониторинга кнопки
-    xTaskCreatePinnedToCore(
-        &wifi_mode_button_task,
-        "wifi_mode_button_task",
-        2048,
-        NULL,
-        tskIDLE_PRIORITY + 2,
-        &wifiModeTaskHandle,
-        0);
-    configASSERT(wifiModeTaskHandle);
-}
 
 // ==============================================
 // РЕАЛИЗАЦИЯ ФУНКЦИЙ TELNET КОНСОЛИ
@@ -1754,7 +1278,7 @@ static esp_err_t cmd_wifi_info(int socket, int argc, char **argv)
              "  Password: %s\r\n"
              "  IP: %s\r\n"
              "\r\n",
-             wifi_ap_mode ? "AP (Access Point)" : "STA (Client)",
+             wifi_manager_is_ap_mode() ? "AP (Access Point)" : "STA (Client)",
              tcp_server_thread_context.serverIpAddr,
              AP_MODE_SSID,
              AP_MODE_PASSWORD,
@@ -1764,20 +1288,20 @@ static esp_err_t cmd_wifi_info(int socket, int argc, char **argv)
     return ESP_OK;
 }
 
-static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv)
-{
-    wifi_ap_mode = !wifi_ap_mode;
-    save_wifi_mode(wifi_ap_mode);
-
+static esp_err_t cmd_wifi_switch(int socket, int argc, char **argv) {
     char response[RESPONSE_BUFFER_SIZE];
+    
     snprintf(response, sizeof(response),
-             "\r\nWiFi mode switched to: %s\r\n"
+             "\r\nSwitching WiFi mode from %s to %s\r\n"
              "Device will reboot in 3 seconds...\r\n\r\n",
-             wifi_ap_mode ? "AP (Access Point)" : "STA (Client)");
+             wifi_manager_is_ap_mode() ? "AP" : "STA",
+             wifi_manager_is_ap_mode() ? "STA" : "AP");
 
     telnet_send_response(socket, response);
-    vTaskDelay(3000 / portTICK_PERIOD_MS);
-    esp_restart();
+    
+    // Use the wifi_manager function
+    wifi_manager_switch_mode();
+    
     return ESP_OK;
 }
 
@@ -2130,6 +1654,7 @@ void app_main()
     //     wifi_init();
     // #endif
 
-    init_wifi_mode_system();
+    ESP_ERROR_CHECK(wifi_manager_init());
+    ESP_ERROR_CHECK(wifi_manager_start()); 
     emg8x_app_start();
 }
